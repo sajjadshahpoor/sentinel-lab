@@ -1,0 +1,64 @@
+// =====================================================================
+// Mission 2 queries — workspace log-sentinel-lab (WKS-L65). Times in UTC.
+// =====================================================================
+
+// My own footprint (Part 1): failures then success for labuser
+SecurityEvent
+| where TimeGenerated > datetime(2026-10-13 07:20)
+| where TargetUserName == "labuser"
+| where EventID in (4624, 4625)
+| sort by TimeGenerated asc
+| project TimeGenerated, EventID, IpAddress, LogonType, WorkstationName
+
+// Who knocked during the attack window? (anyone except me, labuser and the machine)
+SecurityEvent
+| where TimeGenerated between (datetime(2026-10-13 08:06) .. datetime(2026-10-13 09:26))
+| where EventID in (4624, 4625)
+| where TargetUserName !in ("sajjad", "labuser", "SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE", "ANONYMOUS LOGON")
+| where TargetUserName !endswith "$" and TargetUserName !startswith "DWM-" and TargetUserName !startswith "UMFD-"
+| summarize Attempts = count(), First = min(TimeGenerated), Last = max(TimeGenerated)
+    by EventID, TargetUserName, IpAddress, LogonType, WorkstationName
+| sort by First asc
+
+// What else happened in the window? (audit policy change, new process events)
+SecurityEvent
+| where TimeGenerated between (datetime(2026-10-13 08:06) .. datetime(2026-10-13 09:26))
+| where EventID !in (4624, 4634, 4672, 4799, 4798)
+| summarize Count = count(), First = min(TimeGenerated) by EventID, Activity, Account
+| sort by First asc
+
+// What did the intruder run? (4688 exists only after the logging policy change)
+SecurityEvent
+| where TimeGenerated between (datetime(2026-10-13 08:13) .. datetime(2026-10-13 09:26))
+| where EventID == 4688 and Account has "helpdesk"
+| where NewProcessName has_any ("cmd.exe", "powershell.exe", "pwsh.exe", "whoami.exe", "net.exe", "net1.exe")
+| project TimeGenerated, NewProcessName, CommandLine, ParentProcessName
+| sort by TimeGenerated asc
+
+// Did the logging policy change? (audit policy changes in the window)
+SecurityEvent
+| where TimeGenerated between (datetime(2026-10-13 08:06) .. datetime(2026-10-13 08:12))
+| where EventID == 4719
+| project TimeGenerated, Activity, SubjectAccount
+
+// Proof that 4688 did not exist before the policy (Temps 1) and does after (Temps 2)
+SecurityEvent
+| where TimeGenerated > ago(14d)
+| where EventID == 4688
+| summarize Events = count(), First = min(TimeGenerated) by bin(TimeGenerated, 1d)
+| order by TimeGenerated asc
+
+// Detection rule: 5+ failures for one account from one IP within 1 minute, then a success from the same IP
+let window = 1m;
+SecurityEvent
+| where EventID == 4625
+| summarize Failures = count(), FirstFail = min(TimeGenerated), LastFail = max(TimeGenerated)
+    by TargetUserName, IpAddress, bin(TimeGenerated, window)
+| where Failures >= 5
+| join kind=inner (
+    SecurityEvent
+    | where EventID == 4624
+    | project SuccessTime = TimeGenerated, TargetUserName, IpAddress, LogonType
+  ) on TargetUserName, IpAddress
+| where SuccessTime between (LastFail .. LastFail + 5m)
+| project TargetUserName, IpAddress, Failures, FirstFail, SuccessTime, LogonType

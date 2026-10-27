@@ -1,0 +1,99 @@
+// =====================================================================
+// queries.kql — queries used on workspace log-sentinel-lab (WKS-L65)
+// All times in the SIEM are UTC. Local time on WKS-L65 is UTC+2.
+// =====================================================================
+
+
+// ---------- Is the monitoring alive? ----------
+
+// Is my machine sending data, and when did I last hear from it?
+Heartbeat
+| summarize LastSeen = max(TimeGenerated) by Computer
+
+// Is the data current? Compare the machine's clock with Azure's ingestion clock.
+Heartbeat
+| project TimeGenerated, ingestion_time(), Delay = ingestion_time() - TimeGenerated
+| take 20
+
+// Which event levels arrive in the Event table (chain A)?
+Event
+| summarize count() by EventLog, EventLevelName
+
+
+// ---------- Who logged on? ----------
+
+// Chain A: logons are buried in one text field
+Event
+| where EventLog == "Security" and EventID == 4624
+| where RenderedDescription has "sajjad"
+| project TimeGenerated, Computer, RenderedDescription
+| order by TimeGenerated desc
+
+// Chain B: the same logons, already split into columns
+SecurityEvent
+| where EventID == 4624
+| project TimeGenerated, Computer, Account, LogonType, IpAddress
+| order by TimeGenerated desc
+
+// My own logons per day, source and logon type (to know my normal pattern)
+SecurityEvent
+| where EventID == 4624 and Account has "sajjad"
+| summarize Count = count(), First = min(TimeGenerated), Last = max(TimeGenerated)
+    by LogonType, IpAddress, WorkstationName, bin(TimeGenerated, 1d)
+| order by First asc
+
+
+// ---------- Baseline ----------
+
+// Which security event types happen normally, and how often?
+SecurityEvent
+| summarize Count = count(), First = min(TimeGenerated), Last = max(TimeGenerated) by EventID, Activity
+| order by Count desc
+
+// Which accounts normally log on, and how?
+SecurityEvent
+| where EventID in (4624, 4625)
+| summarize Count = count() by EventID, Account, LogonType, IpAddress
+| order by Count desc
+
+// Normal event volume per hour (a spike here was my first clue)
+SecurityEvent
+| summarize Events = count() by bin(TimeGenerated, 1h)
+| order by TimeGenerated asc
+
+// Normal System and Application events (chain A)
+Event
+| where EventLog in ("System", "Application")
+| summarize Count = count() by EventLog, Source, EventID
+| order by Count desc
+
+
+// ---------- Investigation 1: files dropped on the Desktop (2026-10-08) ----------
+
+// Everything around the file creation time (09:13 UTC), excluding SYSTEM
+SecurityEvent
+| where TimeGenerated between (datetime(2026-10-08 09:05) .. datetime(2026-10-08 09:25))
+| where Account !has "SYSTEM"
+| project TimeGenerated, EventID, Activity, Account, LogonType, IpAddress, WorkstationName
+| order by TimeGenerated asc
+
+// Did the QEMU guest agent's actions reach the SIEM? (Answer: no, Information level is not collected)
+Event
+| where EventLog == "Application" and Source == "qemu-ga"
+| project TimeGenerated, RenderedDescription
+| order by TimeGenerated asc
+
+
+// ---------- Investigation 2: hidden admin account (2026-10-09) ----------
+
+// All account and group management on my workstation since Oct 9
+SecurityEvent
+| where TimeGenerated > datetime(2026-10-09)
+| where EventID in (4720, 4722, 4724, 4726, 4728, 4732, 4733, 4738)
+| project TimeGenerated, EventID, Activity, TargetAccount, MemberSid, SubjectAccount
+| order by TimeGenerated asc
+
+// The account creation event
+SecurityEvent
+| where EventID == 4720
+| project TimeGenerated, TargetAccount, SubjectAccount, Activity
