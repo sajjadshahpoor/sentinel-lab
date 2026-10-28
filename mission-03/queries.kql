@@ -1,0 +1,57 @@
+// Mission 3 — Sentinel evidence for the case file
+// Workspace: the one from Missions 1-2. Table: SecurityEvent. Times are UTC.
+// Note: events can lag minutes to a few hours. If a query is empty, widen the time range and retry.
+// Q2 depends on file-share object-access auditing (5140/5145). If it is off, say so in the case file
+// and back that stage from the actions taken instead.
+
+// ============================================================
+// Q1 — The lockout: my own account refused (T1531 context)
+// Shows failed interactive/RDP logons for sajjad, including "account disabled"
+// (4625 SubStatus 0xC0000072 = account currently disabled).
+// ============================================================
+SecurityEvent
+| where TimeGenerated > ago(7d)
+| where EventID in (4625, 4624)
+| where TargetUserName =~ "sajjad"
+| extend Reason = case(
+    SubStatus == "0xc0000072", "account disabled",
+    SubStatus == "0xc000006a", "wrong password",
+    SubStatus == "0xc0000064", "no such user",
+    tostring(SubStatus))
+| project TimeGenerated, EventID, Activity, TargetUserName, LogonType, IpAddress, WorkstationName, Computer, Reason
+| sort by TimeGenerated asc
+
+// ============================================================
+// Q2 — Stage 2 foothold: anonymous access to the Public share on WKS-L65
+// 5140 = a network share object was accessed; 5145 = detailed file share (per-file).
+// Anonymous/guest shows SubjectUserName "ANONYMOUS LOGON" or an anonymous SID.
+// ============================================================
+SecurityEvent
+| where TimeGenerated > ago(7d)
+| where EventID in (5140, 5145)
+| where ShareName has "Public" or RelativeTargetName has "account-access"
+| project TimeGenerated, EventID, SubjectUserName, SubjectDomainName, IpAddress, ShareName, RelativeTargetName, Computer
+| sort by TimeGenerated asc
+
+// ============================================================
+// Q3 — Stage 4 reprise: RDP back in as the recovered local admin svc_deploy
+// Type 3 = network (NLA pre-auth), Type 10 = interactive RDP desktop session.
+// ============================================================
+SecurityEvent
+| where TimeGenerated > ago(2d)
+| where EventID == 4624
+| where TargetUserName =~ "svc_deploy"
+| where LogonType in (3, 10)
+| project TimeGenerated, EventID, TargetUserName, LogonType, IpAddress, WorkstationName, Computer
+| sort by TimeGenerated asc
+
+// ============================================================
+// (Optional) Q4 — any process/command run in the svc_deploy session
+// Only if process-creation auditing (4688) is still enabled from Mission 2.
+// ============================================================
+SecurityEvent
+| where TimeGenerated > ago(2d)
+| where EventID == 4688
+| where Account =~ "WKS-L65\\svc_deploy" or SubjectUserName =~ "svc_deploy"
+| project TimeGenerated, NewProcessName, CommandLine, ParentProcessName, Account
+| sort by TimeGenerated asc
