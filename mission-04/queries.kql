@@ -1,0 +1,79 @@
+// Mission 4 — "A service account goes rogue" — Sentinel investigation (WKS-L65, seat 65)
+// Workspace: the one from Missions 1-3. Table: SecurityEvent. Times UTC (local = UTC+2).
+// Rogue account found: svc-app65 (SPN MSSQLSvc/app65.hamilton.corp). Window: 2026-11-02 13:45-16:30 UTC.
+
+// ============================================================
+// Q0 — collection health check (run first; if empty it's a data problem, not the query)
+// ============================================================
+Heartbeat
+| where TimeGenerated > ago(1d)
+| summarize LastSeen = max(TimeGenerated) by Computer
+| sort by LastSeen desc
+
+// ============================================================
+// Q1 — STEP 1: the logon that should not exist (initial access)  -> T1078.002
+// Lists every non-machine, non-me account that logged on. svc-app65 stands out:
+// 17 batch logons (LogonType 4) on 2026-11-02 between 13:45:40 and 16:30:41 UTC.
+// ============================================================
+SecurityEvent
+| where TimeGenerated > ago(14d)
+| where EventID == 4624
+| where TargetUserName !endswith "$"
+| where TargetUserName !in~ ("SYSTEM","LOCAL SERVICE","NETWORK SERVICE","sajjad","ANONYMOUS LOGON","DWM-1","DWM-2","DWM-3","UMFD-0","UMFD-1","UMFD-2")
+| summarize Logons=count(), First=min(TimeGenerated), Last=max(TimeGenerated),
+            LogonTypes=make_set(LogonType), SrcIPs=make_set(IpAddress)
+    by TargetUserName, Computer
+| sort by Last desc
+
+// ============================================================
+// Q2 — STEP 2: what the account did (execution + discovery)  -> T1059, T1033, T1087.001, T1069.001, T1016
+// 4688 with full command line. Reads as a human orienting themselves right after logon:
+//   whoami ; whoami /all ; net user svc-app65 ; net localgroup administrators ; ipconfig /all
+// then a cmd.exe/conhost process every 15 minutes = the persistence task firing.
+// ============================================================
+SecurityEvent
+| where TimeGenerated > ago(2d)
+| where EventID == 4688
+| where SubjectUserName =~ "svc-app65" or Account has "svc-app65"
+| project TimeGenerated, SubjectUserName, NewProcessName, CommandLine, ParentProcessName
+| sort by TimeGenerated asc
+
+// ============================================================
+// Q3 — STEP 3: data collection / staging  -> T1005, T1074.001
+// NOTE: the staging was a PowerShell cmdlet inside an existing session, so it created NO new
+// process -> it does NOT show in 4688. The proof is the file left on disk:
+//   C:\Users\Public\Desktop\staging\customers.csv  (+ staging-proof.txt), written 14:45:42 UTC.
+// This query is the pointer; recovery was done on the host.
+// ============================================================
+SecurityEvent
+| where TimeGenerated > ago(2d)
+| where EventID == 4688
+| where SubjectUserName =~ "svc-app65"
+| where CommandLine has_any ("Compress-Archive",".zip",".7z","Export-Csv",".csv","robocopy","copy","staging")
+| project TimeGenerated, NewProcessName, CommandLine
+| sort by TimeGenerated asc
+// -> returns nothing: confirms the collection left no process event (reason it from the disk artifact).
+
+// ============================================================
+// Q4 — STEP 4: persistence  -> T1053.005   ** DETECTION GAP **
+// 4698 = scheduled task created. This returns EMPTY in my workspace: the task creation was never
+// collected, so the foothold was invisible to the SIEM. Recovered on the host instead:
+//   \M4-SvcApp65-Persistence  (cmd.exe beacon every 15 min -> C:\ProgramData\m4-persistence-log.txt)
+//   \M4-SvcApp65-Session      (on-demand powershell -ExecutionPolicy Bypass -File ...m4_session_payload.ps1)
+// Remediation: collect 4698 + Task Scheduler operational log; alert on tasks that run as a
+// service account or use -ExecutionPolicy Bypass.
+// ============================================================
+SecurityEvent
+| where TimeGenerated > ago(14d)
+| where EventID == 4698
+| extend TaskName = extract(@'<Data Name="TaskName">([^<]+)</Data>', 1, EventData)
+| project TimeGenerated, SubjectUserName, Computer, TaskName
+| sort by TimeGenerated asc
+
+// Corroboration that the metronome is a recurring task (process every 15 min on the quarter-hour):
+SecurityEvent
+| where TimeGenerated > ago(2d)
+| where EventID == 4688
+| where SubjectUserName =~ "svc-app65"
+| summarize runs=count() by bin(TimeGenerated, 15m)
+| sort by TimeGenerated asc
