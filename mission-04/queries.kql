@@ -81,7 +81,7 @@ SecurityEvent
 
 // ============================================================
 // ============================================================
-// PART 2 — hunting my OWN attack (red team), 2026-11-04 ~15:50-16:05 UTC
+// PART 2 — hunting my OWN attack (red team), 2026-11-04 15:00:01-15:05:48 UTC (16:00 local, CET)
 // ============================================================
 // ============================================================
 
@@ -89,7 +89,9 @@ SecurityEvent
 // P2-Q1 — my logon as svc-app65, set next to the intruder's.
 // The intruder (Part 1) was LogonType 4 (batch, scheduled task, 15-min cadence).
 // Mine is LogonType 3 (network, from smbclient) and 10 (RDP) -> remote, one-off, a human burst.
-// NOTE: IpAddress is the Tailscale subnet-router/exit address, NOT my laptop's real IP (evidence limit).
+// NOTE: IpAddress came back 10.50.0.1 on every one of my logons -- the Tailscale subnet-router/gateway,
+// NOT my laptop's real IP (evidence limit). The intruder's type-4 rows carry a blank IpAddress ("-").
+// WorkstationName leaked "SAJJAD" (my laptop's hostname) on the smbclient logons -- partial attribution.
 // ============================================================
 SecurityEvent
 | where TimeGenerated > ago(3d)

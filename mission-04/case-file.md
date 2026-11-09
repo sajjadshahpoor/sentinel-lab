@@ -74,7 +74,7 @@ Critically, **the scheduled-task creation left no EventID 4698 in my Sentinel** 
 
 # Part 2 — reproducing the theft myself (red team)
 
-> Part 1 reconstructed an intrusion from the defender's side. In Part 2 I ran the same credential theft myself, from my own laptop over Tailscale, against **only my own seat's service account** (`svc-app65`) and **only my own workstation**, then switched back to defender and hunted my own footprints. The other seats carry identical service accounts — they are classmates' evidence and I did not touch them. The attack ran on **2026-11-04, ~15:50–16:05 UTC** (local = UTC+2).
+> Part 1 reconstructed an intrusion from the defender's side. In Part 2 I ran the same credential theft myself, from my own laptop over Tailscale, against **only my own seat's service account** (`svc-app65`) and **only my own workstation**, then switched back to defender and hunted my own footprints. The other seats carry identical service accounts — they are classmates' evidence and I did not touch them. The attack ran on **2026-11-04, 15:00:01–15:05:48 UTC** (16:00 local, CET/UTC+1), and the footprints below are taken from my own Sentinel.
 
 ## 7. The attack, step by step
 
@@ -93,14 +93,25 @@ Critically, **the scheduled-task creation left no EventID 4698 in my Sentinel** 
 | 5 — SPN enumeration | **T1087.002** Account Discovery: Domain Accounts (part of the roast) | Nothing — the LDAP query hit the **DC**, not my workstation; my laptop isn't monitored | **No** |
 | 6 — request TGS (the roast) | **T1558.003** Steal or Forge Kerberos Tickets: Kerberoasting | Nothing — the ticket request is **EventID 4769 on the DC**, which my workspace does not collect | **No — the key gap** |
 | 7 — offline crack | **T1110.002** Brute Force: Password Cracking | Nothing — pure local compute on my laptop, never touches the network | **No** |
-| 8 — logon as `svc-app65` | **T1078.002** Valid Accounts + **T1021.001/.002** (RDP / SMB shares) + **T1005** Data from Local System | **EventID 4624** for `svc-app65`: a **type 10 (RemoteInteractive)** from the RDP attempt and **type 3 (Network)** from the SMB reads; share/file access to `C$` if object-access auditing is on | **Yes** |
+| 8 — logon as `svc-app65` | **T1078.002** Valid Accounts + **T1021.001/.002** (RDP / SMB shares) + **T1005** Data from Local System | **EventID 4624** for `svc-app65`, 2026-11-04 15:00–15:06 UTC: a **type 10 (RemoteInteractive)** from the RDP attempt and four **type 3 (Network)** from the SMB reads, all with source `IpAddress 10.50.0.1` | **Yes** |
 
-**Me vs. the intruder (how a defender tells them apart).** We are the same account, so an alert that only says "`svc-app65` signed on" cannot separate us. The discriminators are:
+My six attack logons, pulled straight from the SecurityEvent 4624 stream (queries.kql P2-Q1), stand out from the pages of `type 4` task logons around them:
+
+```
+2026-11-04 15:00:01Z  type 3  (Network/SMB)        IpAddress 10.50.0.1  WorkstationName "Sajjad"
+2026-11-04 15:00:06Z  type 10 (RemoteInteractive)  IpAddress 10.50.0.1  WorkstationName "WKS-L65"  (RDP ×2 — authenticated, then force-logged-off)
+2026-11-04 15:01:47Z  type 3  (Network/SMB)        IpAddress 10.50.0.1  WorkstationName "-"        (wmiexec SMB auth, before DCOM timed out)
+2026-11-04 15:05:40Z  type 3  (Network/SMB)        IpAddress 10.50.0.1  WorkstationName "SAJJAD"   (smbclient)
+2026-11-04 15:05:48Z  type 3  (Network/SMB)        IpAddress 10.50.0.1  WorkstationName "SAJJAD"   (smbclient C$ -> read the flag file)
+```
+
+**Me vs. the intruder (how a defender tells them apart).** We are the same account, so an alert that only says "`svc-app65` signed on" cannot separate us. The discriminators the data actually shows:
 - **Logon type.** The intruder (Part 1) logged on as **type 4 (batch)** — a scheduled task under stored credentials, firing every 15 minutes. My reproduction is **type 3 (network)** and **type 10 (RDP)** — remote, interactive, one-off, not on the quarter-hour cadence.
-- **Timing.** The intruder recurred on a metronome inside the Part 1 window; mine is a single human burst on 2026-11-04, outside it.
+- **Source address.** Every intruder `type 4` row carries a **blank `IpAddress` (`-`)** — a local task. Every one of mine carries **`10.50.0.1`** — the one signal that my logons came from off the box.
+- **Timing.** The intruder recurs on a metronome, around the clock; mine is a single human burst of six events inside six minutes on 2026-11-04.
 - The detection that catches **both** is the one worth building: *any* interactive or network logon by a service account onto a workstation.
 
-**Limit of my evidence.** The source address on my `svc-app65` logons is **not my laptop's real IP** — it is the Tailscale subnet-router / exit address between my laptop and the lab, which is all the workstation ever sees. From the workstation logs alone I could not attribute these logons to a specific machine; that would need the tailnet connection logs. I record this as a limitation, not a conclusion.
+**Limit of my evidence (confirmed).** Every one of my `svc-app65` logons was recorded with source `IpAddress` **`10.50.0.1`** — the lab's Tailscale subnet-router / gateway, **not my laptop's real address**, which never reaches the workstation. From WKS-L65's logs alone I therefore cannot tie the attack to a specific machine; that would need the tailnet connection logs. One crumb did survive, though: the `WorkstationName` field on my `smbclient` logons carried **`SAJJAD`** — my laptop's own hostname, leaked through the SMB session setup — a partial attribution clue the masked IP never gave away. I record both as limits (and openings) of the evidence, not conclusions.
 
 ## 9. Concrete remediation for the roast (I just proved it works)
 
