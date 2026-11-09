@@ -69,3 +69,53 @@ Critically, **the scheduled-task creation left no EventID 4698 in my Sentinel** 
 - **The detection I wish I'd had:** *"Tell me when an account that normally only runs a service signs on to a workstation."* A single rule on 4624 where the target is a known service account and the host is an endpoint would have caught Stage 1 on its own.
 - **Catching the root cause at the source:** my monitoring would need to watch the **domain controller's** Kerberos service-ticket requests (EventID 4769), and alert on a burst of **RC4-encrypted (0x17)** TGS requests for SPN accounts — that is the on-wire signature of Kerberoasting, and it never touches my workstation.
 - **The one change that would have broken the chain:** moving `svc-app65` to a **gMSA** (or a long random password with AES-only). With no crackable password, the Kerberoast in Stage 0 fails and nothing downstream happens.
+
+---
+
+# Part 2 — reproducing the theft myself (red team)
+
+> Part 1 reconstructed an intrusion from the defender's side. In Part 2 I ran the same credential theft myself, from my own laptop over Tailscale, against **only my own seat's service account** (`svc-app65`) and **only my own workstation**, then switched back to defender and hunted my own footprints. The other seats carry identical service accounts — they are classmates' evidence and I did not touch them. The attack ran on **2026-11-04, ~15:50–16:05 UTC** (local = UTC+2).
+
+## 7. The attack, step by step
+
+**Step 5 — find the roastable accounts (discovery).** As nothing but my own domain user (`sajjad`), with no special rights, I asked the domain controller over LDAP for every account carrying a service principal name (`GetUserSPNs`, Impacket, run from my laptop). It returned one SPN account per seat; mine is `svc-app65`, advertising `MSSQLSvc/app65.hamilton.corp`. From here on I used only my own seat's account.
+
+**Step 6 — request the ticket and carry it away (credential access).** I asked the DC for a Kerberos service ticket for `svc-app65` and saved it in crackable form. I needed **no password** for that account, caused **no failed logon**, and used **no special privilege** — I only requested a service, the way any user does all day. The saved ticket began `$krb5tgs$23$…`: the `23` is **RC4 (encryption type 0x17)**, the old cipher the account still permits, which is exactly what makes the next step fast.
+
+**Step 7 — crack it offline (credential access).** On my laptop, disconnected from the domain, I ran the RC4 TGS-REP ticket against the `rockyou` wordlist (hashcat mode 13100). The password was a dictionary-style value and fell in **seconds**. Nobody on the domain could see this step — it is pure local compute.
+
+**Step 8 — become the account (valid accounts / lateral movement).** With the recovered password I authenticated to my own workstation as `HAMILTON\svc-app65`. An interactive **RDP** session was allowed to authenticate but was **immediately logged off** — the account is not permitted to hold a desktop. **SMB** authentication, however, succeeded. I used it to read a file on the account's own desktop (`C:\Users\svc-app65\Desktop\flag.txt`) whose permissions are restricted to `svc-app65` — a file I **cannot open as myself**. Reading it over SMB authenticated as the account honours that restriction, which is the proof that I truly held the account's rights, not just my own.
+
+## 8. What a defender could see — my footprints, and the gaps
+
+| My step | MITRE technique | What my Sentinel (WKS-L65) recorded | Visible? |
+|---|---|---|---|
+| 5 — SPN enumeration | **T1087.002** Account Discovery: Domain Accounts (part of the roast) | Nothing — the LDAP query hit the **DC**, not my workstation; my laptop isn't monitored | **No** |
+| 6 — request TGS (the roast) | **T1558.003** Steal or Forge Kerberos Tickets: Kerberoasting | Nothing — the ticket request is **EventID 4769 on the DC**, which my workspace does not collect | **No — the key gap** |
+| 7 — offline crack | **T1110.002** Brute Force: Password Cracking | Nothing — pure local compute on my laptop, never touches the network | **No** |
+| 8 — logon as `svc-app65` | **T1078.002** Valid Accounts + **T1021.001/.002** (RDP / SMB shares) + **T1005** Data from Local System | **EventID 4624** for `svc-app65`: a **type 10 (RemoteInteractive)** from the RDP attempt and **type 3 (Network)** from the SMB reads; share/file access to `C$` if object-access auditing is on | **Yes** |
+
+**Me vs. the intruder (how a defender tells them apart).** We are the same account, so an alert that only says "`svc-app65` signed on" cannot separate us. The discriminators are:
+- **Logon type.** The intruder (Part 1) logged on as **type 4 (batch)** — a scheduled task under stored credentials, firing every 15 minutes. My reproduction is **type 3 (network)** and **type 10 (RDP)** — remote, interactive, one-off, not on the quarter-hour cadence.
+- **Timing.** The intruder recurred on a metronome inside the Part 1 window; mine is a single human burst on 2026-11-04, outside it.
+- The detection that catches **both** is the one worth building: *any* interactive or network logon by a service account onto a workstation.
+
+**Limit of my evidence.** The source address on my `svc-app65` logons is **not my laptop's real IP** — it is the Tailscale subnet-router / exit address between my laptop and the lab, which is all the workstation ever sees. From the workstation logs alone I could not attribute these logons to a specific machine; that would need the tailnet connection logs. I record this as a limitation, not a conclusion.
+
+## 9. Concrete remediation for the roast (I just proved it works)
+
+| Weakness I exploited | Why it worked for me | Concrete fix |
+|---|---|---|
+| `svc-app65` allows **RC4** Kerberos tickets | My saved ticket was `etype 23` (RC4); hashcat 13100 cracks RC4 TGS-REP fast | Set `msDS-SupportedEncryptionTypes` to **AES only** on the account; retire RC4 domain-wide |
+| **Weak, guessable password** | It was in `rockyou` — cracked in seconds offline | Move the account to a **gMSA** (128-char machine-managed, auto-rotated), or a **25+ char random** password if a gMSA is impossible. With AES + a long random secret, my exact crack fails outright |
+| Anyone can request the ticket, invisibly to me | The roast is a normal TGS request, logged **only on the DC** (4769), which I don't collect | Collect **DC EventID 4769** and alert on **RC4 (0x17) TGS requests**, especially bursts for SPN accounts — where my Step 6 actually landed |
+| A service account could log on to a workstation | Nothing stopped `svc-app65` authenticating to WKS-L65 over SMB/RDP | **Deny** interactive + network logon rights for service accounts on workstations; **alert** on any 4624 for a service-type account on an endpoint (catches Step 8 and the intruder) |
+| SPN on an ordinary, weak account | The SPN is what made the account roastable at all | Place SPNs only where required, never on weak/human-password accounts; audit SPN accounts for encryption support and password age |
+
+**The single change that breaks the whole chain:** moving `svc-app65` to a **gMSA with RC4 disabled (AES-only)**. SPN enumeration (Step 5) still works, but the ticket carried away (Step 6) is AES-encrypted and protected by a 128-character machine-generated password, so the offline crack (Step 7) cannot succeed — and with no recovered password, Step 8 never happens.
+
+## 10. Stretch answers (Part 2)
+
+- **The one detection question I wish my SIEM answered on its own:** *"Tell me whenever an account that exists to run a service signs on to a workstation — any logon type, any source."* A single rule on 4624 where the target is a known service account and the host is an endpoint catches both the intruder's batch logon and my network/RDP logon.
+- **Catching the roast at the source:** my monitoring would need to collect the **domain controller's** Kerberos service-ticket requests (**EventID 4769**) and alert on **RC4-encrypted (0x17)** TGS requests for SPN accounts — a burst of those is the on-wire signature of Kerberoasting, and it never touches my workstation, which is why Part 2 Step 6 was invisible to me.
+- **The single change to the account that makes the chain far harder:** a **gMSA (or long random password) with RC4 disabled** — it removes the crackable secret the whole attack depends on.
