@@ -188,14 +188,23 @@ Over 14 days the generalised query returned **7 distinct requesters** — all of
 ## 5. Schedule, justified by the measured delay
 
 - **Runs every 5 minutes, looks back 10 minutes.**
-- Ingestion delay for `DC01` events (7-day sample): **p50 = 29 s, p95 = 38 s, p99 = 39 s, max = 93 s**; my own Mission 4 event took **25 s**. Live-replay delay: `TODO(me)`.
+- Ingestion delay for `DC01` events (7-day sample): **p50 = 29 s, p95 = 38 s, p99 = 39 s, max = 93 s**; my own Mission 4 event took **25 s**. Live replay (2026-11-11): the two 4769 events ingested in **30 s and 21 s** — comfortably inside the 10-minute look-back.
 - Justification: the maximum observed delay is 93 s, so a **10-minute look-back overlaps each previous run by 5 minutes** — an event that arrives late still lands inside the next window and cannot fall through the gap, while the 5-minute run interval keeps time-to-detect short. (A look-back equal to the run interval would risk exactly the miss the briefing warns about.)
 
 **Rule configuration (Azure portal → Sentinel → Analytics).** Name `L65 - Kerberoasting: RC4 service ticket request (4769)`, severity High, **Enabled**, incident creation on. Entity mapping: Account (FullName) = `Requester`, IP (Address) = `SrcIP`, Host (FullName) = `Computer`; custom detail `TargetedServices` = `Services`. Alert title: `L65 - Kerberoasting: {{Requester}} requested RC4 tickets for {{ServiceCount}} service(s) from {{SrcIP}}` — so a triager sees who, how many and from where without rerunning the query.
 
 ## 6. Proof it fired (my own replay)
 
-`TODO(me)`: incident number, time, and screenshot (`screenshots/m5-l65-incident.png`) from replaying the ticket request against `svc-app65` and finding the incident raised by the **L65** rule.
+On **2026-11-11** I replayed only the ticket request against `svc-app65` (no cracking) at **18:45:45** and **18:45:54 UTC** — two 4769 events, RC4 (`0x17`), requester `sajjad@HAMILTON.CORP`, source `10.50.0.1`, ingested in **30 s** and **21 s**. My rule's next run searched the window **18:40:13–18:50:13 UTC** (the 10-minute look-back), matched them, and raised an incident:
+
+- **Alert** at **18:55:16 UTC** → **Sentinel incident #69** (Defender incident ID **3072**), created **18:55:39 UTC**, severity **High**, status **New**, 1 alert.
+- **Title:** `L65 - Kerberoasting: sajjad@HAMILTON.CORP requested RC4 tickets for 1 service(s) from 10.50.0.1`.
+- **Entities surfaced on the incident:** account `sajjad@HAMILTON.CORP`, IP `10.50.0.1`, host `DC01` — so a triager sees who, from where and against what without rerunning the query.
+- **Replay → incident ≈ 10 minutes**, consistent with a rule running every 5 minutes over a 10-minute look-back.
+
+![L65 Kerberoasting incident #69 (Defender ID 3072)](../mission-05/m5-l65-incident.png)
+
+(The same replay also raised incidents in classmates' rules, which watch the same domain; the `L65`-titled one is mine.)
 
 ## 7. Triage note (for a second-line analyst)
 
