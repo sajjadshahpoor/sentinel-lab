@@ -130,3 +130,80 @@ My six attack logons, pulled straight from the SecurityEvent 4624 stream (querie
 - **The one detection question I wish my SIEM answered on its own:** *"Tell me whenever an account that exists to run a service signs on to a workstation — any logon type, any source."* A single rule on 4624 where the target is a known service account and the host is an endpoint catches both the intruder's batch logon and my network/RDP logon.
 - **Catching the roast at the source:** my monitoring would need to collect the **domain controller's** Kerberos service-ticket requests (**EventID 4769**) and alert on **RC4-encrypted (0x17)** TGS requests for SPN accounts — a burst of those is the on-wire signature of Kerberoasting, and it never touches my workstation, which is why Part 2 Step 6 was invisible to me.
 - **The single change to the account that makes the chain far harder:** a **gMSA (or long random password) with RC4 disabled** — it removes the crackable secret the whole attack depends on.
+
+---
+
+# Detection
+
+> Mission 4 ended on a blind spot: the Kerberoast ticket request (Part 2, Step 6) was logged only on the domain controller, which my workstation never saw. The DC's security log now flows into a shared Sentinel workspace (`log-hamilton`, domain `hamilton.corp`, DC `DC01.hamilton.corp`), so in this section I find that request where it actually happened, turn it into a detection rule that fires on its own, and prove it catches a roast — mine, and one I did not launch. All times UTC.
+
+**Where the detail lives.** On `DC01`, every Kerberos service-ticket request is **EventID 4769** in the `SecurityEvent` table. On these events the normal columns are empty — every value I need is packed into the `EventData` XML field as `<Data Name="...">value</Data>` pairs, so the query parses that XML and pulls the fields out by name. (DC01 Heartbeat is healthy — ~1/minute; its security events begin 2026-11-04 13:58 UTC, which is why only replays after that date are visible.)
+
+## 1. Rule query
+
+```kql
+SecurityEvent
+| where EventID == 4769
+| extend x = parse_xml(EventData)
+| mv-apply d = x.EventData.Data on (
+    summarize f = make_bag(bag_pack(tostring(d["@Name"]), tostring(d["#text"]))))
+| extend Requester     = tostring(f.TargetUserName),
+         ServiceName   = tostring(f.ServiceName),
+         EncType       = tostring(f.TicketEncryptionType),
+         TicketOptions = tostring(f.TicketOptions),
+         Status        = tostring(f.Status),
+         SrcIP         = trim_start(@"::ffff:", tostring(f.IpAddress))
+| where EncType in ("0x17", "0x18")        // RC4-HMAC / RC4-HMAC-EXP: weak, fast to crack offline
+| where Status == "0x0"                    // only tickets actually issued (a failed request gives nothing to crack)
+| where ServiceName !endswith "$"          // computer accounts: random 120-char passwords, not crackable
+| where ServiceName !~ "krbtgt"            // ticket-granting service, normal TGT traffic
+| where Requester !endswith "$"            // machine-to-machine traffic
+| extend AccountName = tostring(split(Requester, "@")[0]), AccountDomain = tostring(split(Requester, "@")[1])
+| summarize StartTime = min(TimeGenerated), EndTime = max(TimeGenerated),
+            RequestCount = count(), ServiceCount = dcount(ServiceName), Services = make_set(ServiceName)
+          by Requester, AccountName, AccountDomain, SrcIP, Computer
+```
+
+## 2. What it detects (plain English)
+
+A user account requested a Kerberos **service ticket** (4769) encrypted with **RC4 (`0x17`)**. In this domain, normal service tickets are **AES256 (`0x12`)** — over 14 days `DC01` issued **12,311** AES tickets and only **29** RC4 ones, and every one of those 29 was a user account asking for a `svc-app*` service account. RC4 is what Kerberoasting tools deliberately request, because an RC4 ticket is encrypted with the target account's NT hash and can be cracked offline in seconds (exactly what I did in Part 2). The RC4 encryption type on a service-ticket request is therefore the single detail that gives the attack away. A secondary tell seen on every roast is `TicketOptions 0x40810010`, where normal traffic uses `0x40800000` / `0x40810000`.
+
+## 3. MITRE ATT&CK
+
+**T1558.003** — Steal or Forge Kerberos Tickets: Kerberoasting (Tactic: Credential Access).
+
+## 4. False positives excluded, and why
+
+The rule generalises from "my roast" to "any roast": it no longer keys on my name, my seat or my time, only on what makes the request suspicious. Four exclusions keep it clean:
+
+| Excluded | Why it is not a Kerberoast |
+|---|---|
+| `Status != 0x0` | Only tickets actually **issued** are useful — a failed request gives the attacker nothing to crack |
+| `ServiceName` ends with `$` | Computer accounts have random 120-character passwords — their tickets are not worth cracking |
+| `ServiceName =~ krbtgt` | The ticket-granting service — ordinary TGT traffic, not a service roast |
+| `Requester` ends with `$` | Machine-to-machine traffic, not a human/user-driven request |
+
+Over 14 days the generalised query returned **7 distinct requesters** — all of them **seat users running the same Mission 4 roast against their own `svc-app*` account**, plus the shared lab account `training01` (benign requests for `svc-app50/59/62`). **None was a false positive.** The exclusions exist because computer-account and `krbtgt` RC4 traffic *does* occur in the data and would otherwise fire the rule.
+
+## 5. Schedule, justified by the measured delay
+
+- **Runs every 5 minutes, looks back 10 minutes.**
+- Ingestion delay for `DC01` events (7-day sample): **p50 = 29 s, p95 = 38 s, p99 = 39 s, max = 93 s**; my own Mission 4 event took **25 s**. Live-replay delay: `TODO(me)`.
+- Justification: the maximum observed delay is 93 s, so a **10-minute look-back overlaps each previous run by 5 minutes** — an event that arrives late still lands inside the next window and cannot fall through the gap, while the 5-minute run interval keeps time-to-detect short. (A look-back equal to the run interval would risk exactly the miss the briefing warns about.)
+
+**Rule configuration (Azure portal → Sentinel → Analytics).** Name `L65 - Kerberoasting: RC4 service ticket request (4769)`, severity High, **Enabled**, incident creation on. Entity mapping: Account (FullName) = `Requester`, IP (Address) = `SrcIP`, Host (FullName) = `Computer`; custom detail `TargetedServices` = `Services`. Alert title: `L65 - Kerberoasting: {{Requester}} requested RC4 tickets for {{ServiceCount}} service(s) from {{SrcIP}}` — so a triager sees who, how many and from where without rerunning the query.
+
+## 6. Proof it fired (my own replay)
+
+`TODO(me)`: incident number, time, and screenshot (`screenshots/m5-l65-incident.png`) from replaying the ticket request against `svc-app65` and finding the incident raised by the **L65** rule.
+
+## 7. Triage note (for a second-line analyst)
+
+`TODO(me)`, from the incident my rule raises on the unannounced attack:
+- **Who** (requesting account) · **Which service accounts** were targeted · **From where** (SrcIP) · **When** (first/last) · **How many** requests / distinct services.
+- **Verdict + reason.** Signs it is *not* a classmate replaying within the rules: the requester is not a seat user; it asks for **several service accounts belonging to other seats**; many requests within seconds; the source is not the usual `10.50.0.1`. (Known-benign baseline to check first: `training01` has made legitimate requests for `svc-app50/59/62`.)
+- **Recommended action.** Reset the passwords of the targeted service accounts (ideally move them to gMSA / AES-only), check `DC01` 4624 for later sign-ons by those accounts, and disable the requester if malicious.
+
+## 8. What a defender here still cannot see
+
+A defender in this domain still cannot see the **offline cracking** itself (it happens on the attacker's laptop, never touching the domain), cannot tell **which machine** is behind the `10.50.0.1` gateway, and would **miss a Kerberoast that requests AES tickets** — because this rule keys on RC4.
