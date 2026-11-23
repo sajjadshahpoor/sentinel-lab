@@ -16,15 +16,18 @@ then authenticate as that account. Weak passwords on service accounts therefore 
 un-alarmed Kerberos request into full credential theft of a privileged, non-interactive account.
 
 ## 3. Current state (read-only, allowed)
-Current effective policy (Default Domain Policy — to be confirmed against the live value):
+Current effective policy (read live from the DC over LDAP, as my own account):
 
 ```
-Minimum password length:   7      (allows human-memorable, crackable secrets)
-Complexity:                Enabled
-Max/Min password age:      <current>
-Lockout:                   <current>
+minPwdLength      : 7          <-- allows human-memorable, crackable secrets (the root cause)
+pwdProperties     : 1          (password complexity enabled)
+pwdHistoryLength  : 24
+maxPwdAge         : 42 days
+lockoutThreshold  : 0          <-- NO account lockout: unlimited online guessing is also possible
+Fine-grained PWD policies (PSOs): none
 ```
-`‹TODO(me): paste the live output of  Get-ADDefaultDomainPasswordPolicy  (and any existing PSOs)›`
+A ready-made target group already exists: **`M6-SvcApp-Accounts`** (18 members — the seat service
+accounts, incl. `svc-app65`), so a PSO can be scoped to exactly these accounts with no user impact.
 
 ## 4. Proposed change (exact values, with justification)
 Service accounts are **never typed by a human**, so length is free and is exactly what defeats
@@ -34,7 +37,8 @@ service accounts, rather than raising the rule for everyone:
 
 | Setting | Proposed | Why |
 |---|---|---|
-| **Min length (service accounts)** | **≥ 25 characters** (PSO on a `Service Accounts` group) | 25+ random chars make offline Kerberoast cracking infeasible; no human types it, so no usability cost |
+| **Min length (service accounts)** | **≥ 25 characters** (PSO scoped to the existing **`M6-SvcApp-Accounts`** group) | 25+ random chars make offline Kerberoast cracking infeasible; no human types it, so no usability cost |
+| **Account lockout (domain)** | **threshold 10 / 15-min window / 15-min duration** | currently `0` (none) — add one so online password guessing is also bounded, not just offline |
 | Complexity (service accounts) | Enabled | defence in depth; cost is zero for generated passwords |
 | Max password age (service accounts) | ≤ 180 days, or managed rotation (gMSA) | bounds exposure of any leaked secret |
 | **Min length (all human users)** *(optional, lower priority)* | **14 characters** on the default domain policy | modest raise; aligns with current baseline guidance |

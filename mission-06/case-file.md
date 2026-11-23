@@ -29,12 +29,16 @@ Set-LocalUser    -Name svc_deploy -Password (ConvertTo-SecureString -AsPlainText
 **After (replayed attack).** I replayed the exact Mission 3 move — RDP to WKS-L65 as `WKS-L65\svc_deploy` with the old leaked password — and read the refusal carefully. A clean refusal is *"the account is disabled"* / logon failed; it is **not** "access denied" (Windows can deny a *local* account remote access even with the right password — that would not prove the password is dead) and **not** an apparent success (some services accept anonymous sessions whatever name you give).
 
 ```
-‹proof: xfreerdp /u:svc_deploy /d:WKS-L65 /p:'‹old leaked pw›' /v:10.50.0.65 /cert:ignore ›
-‹expected: logon fails — "account is currently disabled" (Security log 4625, SubStatus 0xC0000072)›
-‹TODO(me): paste the exact error + the 4625 line›
+# account state on WKS-L65:
+Get-LocalUser svc_deploy   ->  Enabled : False
+# replay (Impacket SMB login, which reports the exact status with no anonymous fallback),
+# using the old password recovered from the cpassword (14 chars) — NOT cracked, just decrypted:
+domain=''        : REFUSED -> SMB SessionError 0xc000006d STATUS_LOGON_FAILURE
+domain='WKS-L65' : "succeeded" -> this is the GUEST fallback the briefing warns about, not a real
+                   logon (the server maps the failed login to a guest session). Discarded.
 ```
 
-**Why this is the right refusal:** 0xC0000072 (account disabled) proves the credential no longer works. If I had only deleted the file and left the account enabled, this same attack would still succeed.
+**Why this is the right refusal:** the account is **disabled** (`Enabled False`) *and* its password was rotated, so the old credential returns a clean **logon failure (0xc000006d)** — not "access denied" (which would be the remote-local-account rule, no proof) and not the guest "success" (anonymous fallback, no proof). If I had only deleted the file and left the account enabled, this same credential would still work: **removing the file never un-leaked the password; disabling the account did.**
 
 ---
 
@@ -64,10 +68,17 @@ head -c 14 svc-app65_hardened.kerb     # names the encryption
 - **Crack:** RC4 cracked with `-m 13100` in seconds in Mission 4. The AES ticket needs `hashcat -m 19700` (TGS-REP AES256) and, against a 32-char random password, runs effectively forever — I started it, recorded the rate and that it exhausts the wordlist with no hit, and stopped it. Both facts (far slower mode + no result) are the proof; I do not need to wait for it to finish.
 
 ```
-‹proof: head -c 14 of the before/after tickets (show $krb5tgs$23$ vs $krb5tgs$18$)›
-‹proof: hashcat -m 19700 ... --status  (one status line: rate + "Exhausted/Running", NO cracked value)›
-‹TODO(me): paste the two ticket prefixes and the one hashcat status line›
+# attribute change (LDAP, as my own account): msDS-SupportedEncryptionTypes  4 (RC4-only)  ->  24 (AES128+AES256)
+# then a CLEARTEXT password reset on the box (ADSI) regenerated the Kerberos AES keys.
+# replay, ticket prefix only:
+  BEFORE (Mission 4):  $krb5tgs$23$...   (etype 23 = RC4-HMAC)
+  AFTER  (Mission 6):  $krb5tgs$18$...   (etype 18 = AES256)
+# crack, same rockyou wordlist:
+  BEFORE:  hashcat -m 13100 (RC4)     -> cracked in seconds
+  AFTER :  hashcat -m 19700 (AES256)  -> Speed ~10,542 H/s, Recovered 0/1, infeasible (stopped early)
 ```
+
+> **Subtlety worth recording:** a password reset performed *over the network via SAMR* (NTLM) set the NT/RC4 hash but **did not generate AES keys** ("User no longer has valid AES keys … until they change their password again"), so the first replay still returned RC4. Only a **cleartext** reset (ADSI/Set-ADAccountPassword, run on the domain-joined workstation so it reaches the DC's sealed channel) regenerated the AES keys — after which the replay returned `$krb5tgs$18$` and the RC4 path was gone.
 
 ---
 
@@ -75,7 +86,7 @@ head -c 14 svc-app65_hardened.kerb     # names the encryption
 
 The service-account password was weak because the **domain password policy** allowed it. That policy is shared by the whole class, so I may not change it — I **requested** a change. The full request is in **[change-request.md](change-request.md)**; summary:
 
-- **Finding / risk:** the current default-domain-policy minimum length lets a human-memorable password protect a service account, which makes offline Kerberoasting trivial.
+- **Finding / risk:** the live default domain policy sets **minimum length 7** with **no account lockout** (`lockoutThreshold 0`) and **no PSOs**, so a human-memorable password can protect a service account — which makes offline Kerberoasting trivial (and online guessing unbounded).
 - **Proposed fix:** a **Fine-Grained Password Policy (PSO)** applied to a `Service Accounts` group requiring **≥ 25 characters** (service accounts are never typed by a human, so length is free and is what defeats offline cracking — NIST SP 800-63B favours length over composition). Recommend the PSO (targeted) over a domain-wide raise, so ordinary users are not forced to 25 characters; optionally raise the domain default to 14 for human accounts.
 - **Affected accounts / rollback:** affects only members of the `Service Accounts` group; rollback = unlink/delete the PSO (effective on next password set).
 
